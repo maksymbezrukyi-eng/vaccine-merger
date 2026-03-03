@@ -16,20 +16,44 @@ from datetime import datetime
 import os
 
 # ── Реєструємо шрифт з підтримкою кирилиці ──────────────────────────
-_FONT_PATHS = [
-    "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-    "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+# Шукаємо FreeSans у кількох можливих шляхах (локально і на Streamlit Cloud)
+_FONT_SEARCH = [
+    ("/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+     "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"),
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+    ("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+     "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"),
 ]
-_FONTS_OK = all(os.path.exists(p) for p in _FONT_PATHS)
-if _FONTS_OK:
-    try:
-        pdfmetrics.registerFont(TTFont("FreeSans",     _FONT_PATHS[0]))
-        pdfmetrics.registerFont(TTFont("FreeSansBold", _FONT_PATHS[1]))
-    except Exception:
-        _FONTS_OK = False
 
-PDF_FONT      = "FreeSans"     if _FONTS_OK else "Helvetica"
-PDF_FONT_BOLD = "FreeSansBold" if _FONTS_OK else "Helvetica-Bold"
+_FONTS_OK = False
+PDF_FONT      = "Helvetica"
+PDF_FONT_BOLD = "Helvetica-Bold"
+
+for _reg, _bold in _FONT_SEARCH:
+    if os.path.exists(_reg) and os.path.exists(_bold):
+        try:
+            pdfmetrics.registerFont(TTFont("CyrillicRegular", _reg))
+            pdfmetrics.registerFont(TTFont("CyrillicBold",    _bold))
+            PDF_FONT      = "CyrillicRegular"
+            PDF_FONT_BOLD = "CyrillicBold"
+            _FONTS_OK = True
+            break
+        except Exception:
+            continue
+
+# Якщо жоден шрифт не знайдено — шукаємо будь-який ttf з підтримкою Unicode
+if not _FONTS_OK:
+    import glob
+    for _ttf in glob.glob("/usr/share/fonts/**/*.ttf", recursive=True):
+        try:
+            pdfmetrics.registerFont(TTFont("CyrillicRegular", _ttf))
+            PDF_FONT      = "CyrillicRegular"
+            PDF_FONT_BOLD = "CyrillicRegular"
+            _FONTS_OK = True
+            break
+        except Exception:
+            continue
 
 # ─────────────────────────────────────────────
 # НАЛАШТУВАННЯ СТОРІНКИ
@@ -593,12 +617,21 @@ if "org_name" in st.session_state:
 
     # ── КРОК 2: Завантаження ─────────────────────────────────────────
     st.header("📂 Крок 2 — Завантажте файли ЗОЗ")
+    st.info("💡 Щоб обрати кілька файлів одночасно — утримуйте **Ctrl** (або **Cmd** на Mac) при виборі.")
+
     uploaded_files = st.file_uploader("Оберіть файли Excel (.xlsx)", type=["xlsx"],
                                       accept_multiple_files=True)
 
+    # Зберігаємо файли у session_state щоб не губились після rerun
     if uploaded_files:
+        st.session_state["uploaded_files_bytes"] = [(f.name, f.read(), f.size) for f in uploaded_files]
+
+    # Беремо файли або з поточного завантаження, або зі збереженого стану
+    files_in_memory = st.session_state.get("uploaded_files_bytes", [])
+
+    if files_in_memory:
         exp      = st.session_state["expected_count"]
-        sub_cnt  = len(uploaded_files)
+        sub_cnt  = len(files_in_memory)
         miss_cnt = max(0, exp - sub_cnt)
         pct      = min(100, round(sub_cnt / exp * 100))
 
@@ -614,20 +647,28 @@ if "org_name" in st.session_state:
 
         st.divider()
         st.header("📋 Крок 3 — Список завантажених файлів")
-        st.dataframe(pd.DataFrame([{"Файл": f.name, "Розмір": f"{round(f.size/1024,1)} КБ",
-                                    "Статус": "⏳ Очікує перевірки"} for f in uploaded_files]),
+        st.dataframe(pd.DataFrame([{"Файл": fname, "Розмір": f"{round(fsize/1024,1)} КБ",
+                                    "Статус": "⏳ Очікує перевірки"}
+                                   for fname, _, fsize in files_in_memory]),
                      use_container_width=True, hide_index=True)
 
-        st.header("🔍 Крок 4 — Перевірка файлів")
+        col_check, col_reset = st.columns([3, 1])
+        with col_reset:
+            if st.button("🗑️ Очистити файли", use_container_width=True):
+                st.session_state.pop("uploaded_files_bytes", None)
+                st.session_state.pop("results", None)
+                st.session_state.pop("corrections_log", None)
+                st.rerun()
+        with col_check:
+            st.header("🔍 Крок 4 — Перевірка файлів")
         if st.button("▶️ Запустити перевірку", type="primary", use_container_width=True):
-            files_bytes = [(f.name, f.read()) for f in uploaded_files]
             results = []
             pb = st.progress(0, text="Перевірка виконується...")
-            for i, (fname, fbytes) in enumerate(files_bytes):
+            for i, (fname, fbytes, _) in enumerate(files_in_memory):
                 r = validate_file(fbytes, fname)
                 r["_bytes"] = fbytes
                 results.append(r)
-                pb.progress((i+1)/len(files_bytes), text=f"Перевірено {i+1} з {len(files_bytes)}: {fname}")
+                pb.progress((i+1)/len(files_in_memory), text=f"Перевірено {i+1} з {len(files_in_memory)}: {fname}")
             st.session_state["results"] = results
             st.session_state["corrections_log"] = {}
             st.rerun()
