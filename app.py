@@ -341,41 +341,40 @@ def build_coverage_excel(facility_data_list, selected_facilities, selected_indic
     thin          = Side(style="thin", color="BFBFBF")
     border        = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    # Заголовок
-    ws.merge_cells(f"A1:{chr(66 + len(facilities))}1")
+    # Заголовок (рядок 1): зливаємо по ширині всіх стовпців
+    total_cols = 1 + len(all_labels)
+    end_col_letter = get_col_letter(total_cols)
+    ws.merge_cells(f"A1:{end_col_letter}1")
     ws["A1"] = f"Таблиця охоплення щепленнями — {st.session_state.get('report_label', '')}"
-    ws["A1"].font = Font(bold=True, size=12)
-    ws["A1"].alignment = center
     ws["A1"].fill = header_fill
     ws["A1"].font = Font(color="FFFFFF", bold=True, size=12)
+    ws["A1"].alignment = center
 
-    # Рядок заголовків
-    ws["A2"] = "Вакцина / Вікова група"
+    # Рядок заголовків (рядок 2): A2 = "Заклад", далі — показники
+    ws["A2"] = "Заклад"
     ws["A2"].fill = subhead_fill
     ws["A2"].font = subhead_font
     ws["A2"].alignment = center
     ws["A2"].border = border
     ws.column_dimensions["A"].width = 35
 
-    for col_idx, fd in enumerate(facilities, start=2):
-        cell = ws.cell(row=2, column=col_idx, value=fd["name"])
+    for col_idx, label in enumerate(all_labels, start=2):
+        cell = ws.cell(row=2, column=col_idx, value=label)
         cell.fill = subhead_fill
         cell.font = subhead_font
-        cell.alignment = center
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cell.border = border
-        col_letter = get_col_letter(col_idx)
-        ws.column_dimensions[col_letter].width = 18
+        ws.column_dimensions[get_col_letter(col_idx)].width = 16
 
-    ws.row_dimensions[2].height = 45
+    ws.row_dimensions[2].height = 60
 
-    # Дані
-    for row_idx, label in enumerate(all_labels, start=3):
-        # Назва індикатора
-        cell_a = ws.cell(row=row_idx, column=1, value=label)
+    # Дані: кожен рядок = один ЗОЗ
+    for row_idx, fd in enumerate(facilities, start=3):
+        cell_a = ws.cell(row=row_idx, column=1, value=fd["name"])
         cell_a.alignment = Alignment(vertical="center", wrap_text=True)
         cell_a.border = border
 
-        for col_idx, fd in enumerate(facilities, start=2):
+        for col_idx, label in enumerate(all_labels, start=2):
             pct = None
             for item in fd["coverage"]:
                 if item["label"] == label:
@@ -384,7 +383,7 @@ def build_coverage_excel(facility_data_list, selected_facilities, selected_indic
 
             cell = ws.cell(row=row_idx, column=col_idx)
             if pct is not None:
-                cell.value = pct / 100  # зберігаємо як відсоток
+                cell.value = pct / 100
                 cell.number_format = "0.0%"
                 if pct >= 95:
                     cell.fill = green_fill
@@ -398,11 +397,11 @@ def build_coverage_excel(facility_data_list, selected_facilities, selected_indic
             cell.border = border
 
     # Легенда
-    legend_row = len(all_labels) + 4
-    ws.cell(row=legend_row, column=1, value="Легенда:").font = Font(bold=True)
-    ws.cell(row=legend_row+1, column=1, value="≥ 95% — виконання плану").fill = green_fill
-    ws.cell(row=legend_row+2, column=1, value="85–95% — потребує уваги").fill = yellow_fill
-    ws.cell(row=legend_row+3, column=1, value="< 85% — критично").fill = red_fill
+    legend_row = len(facilities) + 4
+    ws.cell(row=legend_row,   column=1, value="Легенда:").font = Font(bold=True)
+    ws.cell(row=legend_row+1, column=1, value="≥ 95% — виконання плану").fill  = green_fill
+    ws.cell(row=legend_row+2, column=1, value="85–95% — потребує уваги").fill  = yellow_fill
+    ws.cell(row=legend_row+3, column=1, value="< 85% — критично").fill         = red_fill
 
     output = io.BytesIO()
     wb.save(output)
@@ -444,7 +443,8 @@ with st.form("org_form"):
                                     format_func=lambda x: month_names[x], index=1)
     with col5:
         expected_count = st.number_input("Кількість ЗОЗ що мають подати звіт",
-                                         min_value=1, max_value=500, value=10, step=1)
+                                         min_value=1, max_value=500, value=None,
+                                         step=1, placeholder="Введіть кількість...")
 
     submitted = st.form_submit_button("✅ Підтвердити реквізити", type="primary", use_container_width=True)
 
@@ -456,6 +456,8 @@ if submitted:
         form_errors.append("Введіть код ЄДРПОУ")
     elif not org_edrpou.strip().isdigit():
         form_errors.append("Код ЄДРПОУ повинен містити тільки цифри")
+    if expected_count is None:
+        form_errors.append("Введіть кількість ЗОЗ що мають подати звіт")
     if form_errors:
         for e in form_errors:
             st.error(f"❌ {e}")
