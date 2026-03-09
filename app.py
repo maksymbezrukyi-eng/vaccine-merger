@@ -87,7 +87,6 @@ def validate_file(file_bytes, filename):
     """Повна валідація одного файлу. Повертає dict з результатами."""
     errors, warnings = [], []
     name, edrpou, period, wb = "—", "—", "—", None
-    # зберігаємо деталі помилок для форми виправлення
     fixable = {}
 
     try:
@@ -103,41 +102,53 @@ def validate_file(file_bytes, filename):
         ws_plan = wb["План"]
         ws_exec = wb["Виконання"]
         ws_rem  = wb["Залишки"]
+        ws_zvit = wb["Зведений звіт"]
 
-        # Назва закладу
-        raw_name = ws_plan["D8"].value
+        # ── Назва закладу ─────────────────────────────────────────────
+        # Первинне джерело: Виконання!C4 (заповнене у всіх реальних файлах)
+        # Резервне: План!D8
+        raw_name = ws_exec["C4"].value or ws_plan["D8"].value
         name = str(raw_name).strip() if raw_name else "—"
         if not raw_name or name == "":
-            errors.append("Порожня назва закладу (План!D8)")
+            errors.append("Порожня назва закладу (Виконання!C4)")
             fixable["org_name"] = ""
         else:
             fixable["org_name_current"] = name
 
-        # ЄДРПОУ
-        raw_edrpou = ws_plan["E8"].value
+        # ── ЄДРПОУ ───────────────────────────────────────────────────
+        # Первинне джерело: Виконання!F4
+        # Резервне: План!E8
+        # Примітка: ЄДРПОУ в рядках даних аркушу "План" (col B) —
+        # завжди містить код ЦКПХ (шаблон), не перевіряємо
+        raw_edrpou = ws_exec["F4"].value or ws_plan["E8"].value
         edrpou = str(raw_edrpou).strip().lstrip("'") if raw_edrpou else "—"
         if not raw_edrpou:
-            errors.append("Порожній код ЄДРПОУ (План!E8)")
+            errors.append("Порожній код ЄДРПОУ (Виконання!F4)")
             fixable["org_edrpou"] = ""
-        elif not edrpou.isdigit() or len(edrpou) not in (7, 8, 9, 10):
-            warnings.append(f"Код ЄДРПОУ '{edrpou}' має нестандартну довжину")
+        elif not str(edrpou).isdigit() or len(str(edrpou)) not in (7, 8, 9, 10):
+            warnings.append(f"Код ЄДРПОУ '{edrpou}' має нестандартну довжину або містить не цифри")
             fixable["org_edrpou"] = edrpou
         else:
             fixable["org_edrpou_current"] = edrpou
 
-        # Звітний період
+        # ── Звітний період ───────────────────────────────────────────
         raw_period = ws_exec["F6"].value
         period = str(raw_period) if raw_period else "—"
         if not raw_period:
             errors.append("Відсутній звітний період (Виконання!F6)")
             fixable["report_period"] = True
 
-        # Узгодженість назви
-        name_exec = ws_exec["C4"].value
-        if name_exec and raw_name and str(name_exec).strip() != name:
-            warnings.append("Назва закладу різниться між аркушами «План» і «Виконання»")
+        # ── Узгодженість назви між аркушами ─────────────────────────
+        names_all = {
+            "Виконання!C4":  str(ws_exec["C4"].value or "").strip(),
+            "Залишки!A3":    str(ws_rem.cell(3, 1).value or "").strip(),
+            "Зведений!A3":   str(ws_zvit.cell(3, 1).value or "").strip(),
+        }
+        non_empty_names = [v for v in names_all.values() if v]
+        if len(set(non_empty_names)) > 1:
+            warnings.append(f"Назва закладу різниться між аркушами: {names_all}")
 
-        # Від'ємні значення у Виконанні
+        # ── Від'ємні значення у Виконанні ────────────────────────────
         neg_values = {}
         for row in range(8, 105):
             val = ws_exec.cell(row=row, column=5).value
@@ -149,7 +160,7 @@ def validate_file(file_bytes, filename):
         if neg_values:
             fixable["neg_values"] = neg_values
 
-        # Балансова формула залишків
+        # ── Балансова формула залишків ────────────────────────────────
         balance_errors = {}
         for row in range(11, 38):
             vaccine = ws_rem.cell(row=row, column=1).value
@@ -170,7 +181,19 @@ def validate_file(file_bytes, filename):
         if balance_errors:
             fixable["balance_errors"] = balance_errors
 
-        # Протипокази
+        # ── НОВА: Залишки — Використано ≥ Виконано ───────────────────
+        for row in range(11, 38):
+            vaccine = ws_rem.cell(row=row, column=1).value
+            if not vaccine: continue
+            used = safe_num(ws_rem.cell(row=row, column=6).value)  # col F
+            done = safe_num(ws_rem.cell(row=row, column=5).value)  # col E
+            if done > 0 and used < done:
+                warnings.append(
+                    f"Залишки «{str(vaccine).strip()}»: використано ({int(used)}) < "
+                    f"виконано щеплень ({int(done)}) — фізично неможливо"
+                )
+
+        # ── Протипокази ───────────────────────────────────────────────
         contra_errors = {}
         for row in range(8, 11):
             p = safe_num(ws_exec.cell(row=row, column=16).value)
@@ -182,12 +205,75 @@ def validate_file(file_bytes, filename):
         if contra_errors:
             fixable["contra_errors"] = contra_errors
 
-        # КДП-3
+        # ── КДП-3 ─────────────────────────────────────────────────────
         for row in range(8, 11):
             l_val = safe_num(ws_exec.cell(row=row, column=12).value)
             m_val = safe_num(ws_exec.cell(row=row, column=13).value)
             if m_val > l_val > 0:
-                errors.append(f"Рядок {row}: «Отримали КДП-3» ({m_val}) > «Народилося за 7 міс.» ({l_val})")
+                errors.append(f"Рядок {row}: «Отримали КДП-3» ({int(m_val)}) > «Народилося за 7 міс.» ({int(l_val)})")
+
+        # ── НОВА: Виконання "всього" (col G) ↔ Зведений звіт "місяць" (col D) ──
+        EXEC_ZVIT_PAIRS = [
+            (11,  15,  "БЦЖ"),
+            (23,  28,  "Поліомієліт"),
+            (35,  41,  "Гепатит В"),
+            (42,  49,  "КПК"),
+            (48,  56,  "Hib"),
+            (61,  70,  "ВПЛ"),
+            (99,  114, "АКДП"),
+            (100, 115, "АаКДП"),
+            (101, 116, "АДП"),
+            (103, 118, "АДПм"),
+            (104, 119, "АП"),
+        ]
+        for exec_row, zvit_row, label in EXEC_ZVIT_PAIRS:
+            exec_val = safe_num(ws_exec.cell(row=exec_row, column=7).value)
+            zvit_val = safe_num(ws_zvit.cell(row=zvit_row, column=4).value)
+            if abs(exec_val - zvit_val) > 0.5 and (exec_val > 0 or zvit_val > 0):
+                errors.append(
+                    f"Розбіжність «{label}»: Виконання р{exec_row} всього={int(exec_val)} ≠ "
+                    f"Зведений звіт р{zvit_row} місяць={int(zvit_val)}"
+                )
+
+        # ── НОВА: % у Зведеному звіті = ytd / план × 100 ─────────────
+        for row in range(11, 120):
+            plan_v = ws_zvit.cell(row=row, column=3).value
+            ytd_v  = ws_zvit.cell(row=row, column=5).value
+            pct_v  = ws_zvit.cell(row=row, column=6).value
+            vac_v  = ws_zvit.cell(row=row, column=1).value
+            if (isinstance(plan_v, (int, float)) and plan_v > 0
+                    and isinstance(ytd_v, (int, float))
+                    and isinstance(pct_v, (int, float))):
+                expected_pct = round(ytd_v / plan_v * 100, 2)
+                if abs(pct_v - expected_pct) > 1.0:
+                    warnings.append(
+                        f"Зведений звіт р{row} «{str(vac_v or '').strip()}»: "
+                        f"% у файлі={round(pct_v, 1)}, розрахунковий={expected_pct} "
+                        f"(план={int(plan_v)}, ytd={int(ytd_v)})"
+                    )
+
+        # ── НОВА: План (col F) ↔ Зведений звіт "річний план" (col C) ─
+        PLAN_ZVIT_PLAN_PAIRS = [
+            (12,  34,  "Геп В 3, до 1 р"),
+            (14,  20,  "Поліо 3, до 1 р"),
+            (15,  23,  "Поліо 4, 18 міс"),
+            (16,  26,  "Поліо 5, 6 р"),
+            (17,  81,  "АКДП-3, до 1 р"),
+            (20,  100, "АДПм, 16 р"),
+            (21,  108, "АДПм рев, дорослі"),
+            (24,  43,  "КПК-1, 1 рік"),
+            (25,  46,  "КПК-2, 4 роки"),
+            (26,  57,  "ВПЛ 1 доза, 12 р"),
+            (27,  58,  "ВПЛ 1 доза, 13 р"),
+        ]
+        for plan_row, zvit_row, label in PLAN_ZVIT_PLAN_PAIRS:
+            plan_v = safe_num(ws_plan.cell(row=plan_row, column=6).value)
+            zvit_v = safe_num(ws_zvit.cell(row=zvit_row, column=3).value)
+            if abs(plan_v - zvit_v) > 0.5 and (plan_v > 0 or zvit_v > 0):
+                warnings.append(
+                    f"Розбіжність планів «{label}»: "
+                    f"План р{plan_row}={int(plan_v)} ≠ Зведений р{zvit_row}={int(zvit_v)}"
+                )
 
     except Exception as e:
         errors.append(f"Не вдалось прочитати файл: {e}")
@@ -486,6 +572,200 @@ def aggregate_files(file_bytes_list, org_name, org_edrpou, report_period):
 
     out = io.BytesIO()
     template_wb.save(out)
+    out.seek(0)
+    return out.getvalue()
+
+
+def generate_level1_file(good_results, org_name, org_edrpou, report_period):
+    """Генерує Level1 файл (плоскі таблиці) для подачі на національний рівень."""
+    wb_out = Workbook()
+    wb_out.remove(wb_out.active)
+
+    # Заголовки аркушів
+    H_ZVEDENY = [
+        "Вакцина", "Вік",
+        "Кількість осіб, що підлягали щепленню у звітному році",
+        "Кількість осіб, яким проведено щеплення за звітний місяць",
+        "Назва закладу", "код ЄДРПОУ", "Звітний період",
+    ]
+    H_ARKUSH2 = [
+        "Назва закладу", "код ЄДРПОУ", "Вакцина", "Вік", "Кількість щеплень", "Звітний період",
+        "Народилось дітей в пологому стаціонарі у звітному місяці",
+        "з них підлягали на вакцинацію проти гепатиту В у першу добу життя",
+        "народилося за 7 місяців до звітного періоду",
+        "з них отримали КДП 3 до 6 місяців 29 днів",
+        "антиген та вік", "Кількість підлягаючих щепленню дітей за звітній місяць",
+        "Тимчасові", "Постійні", "ВСЬОГО",
+        "ВІДМОВИ (кількість дітей до 2 років з відмовами від профілактичних щеплень, стан",
+        "кількість відмов",
+    ]
+    H_ZALISHOK = [
+        "Вакцина",
+        "Залишок на початок звітного періоду (доз)", "Отримано (доз)",
+        "Залишок на кінець звітного періоду (доз)", "Виконано щеплень",
+        "Використано вакцини (доз)",
+        "Закуплено за кошти місцевого бюджету (доз)",
+        "Закуплено з інших джерел фінансування (доз)",
+        "Назва закладу", "код ЄДРПОУ", "Звітний період",
+    ]
+    H_PLANUV = [
+        "Назва закладу", "код ЄДРПОУ", "РІК",
+        "Інфекційна хвороба проти  якої планується проведення профілактичного щеплення",
+        "Вік", "Кількість осіб, які підлягають профілактичному щепленню",
+        "Примітка", "Вакцинація",
+    ]
+    H_ARKUSH3 = [
+        "Назва закладу", "код ЄДРПОУ", "Звітний період",
+        "Народилось дітей в пологому стаціонарі у звітному місяці",
+        "з них підлягали на вакцинацію проти гепатиту В у першу добу життя",
+        "народилося за 7 місяців до звітного періоду",
+        "з них отримали КДП 3 до 6 місяців 29 днів",
+    ]
+    H_ARKUSH4 = [
+        "Назва закладу", "код ЄДРПОУ", "Звітний період", "антиген та вік",
+        "Кількість підлягаючих щепленню дітей за звітній місяць",
+        "Тимчасові", "Постійні", "ВСЬОГО",
+    ]
+    H_ARKUSH5 = [
+        "ВІДМОВИ (кількість дітей до 2 років з відмовами від профілактичних щеплень, стан",
+        "кількість відмов", "Звітний період", "Назва закладу", "код ЄДРПОУ",
+    ]
+
+    ws_zv  = wb_out.create_sheet("зведений")
+    ws_a2  = wb_out.create_sheet("Аркуш2")
+    ws_zal = wb_out.create_sheet("Залишок")
+    ws_pl  = wb_out.create_sheet("Планування")
+    ws_a3  = wb_out.create_sheet("Аркуш3")
+    ws_a4  = wb_out.create_sheet("Аркуш4")
+    ws_a5  = wb_out.create_sheet("Аркуш5")
+
+    for ws, headers in [
+        (ws_zv, H_ZVEDENY), (ws_a2, H_ARKUSH2), (ws_zal, H_ZALISHOK),
+        (ws_pl, H_PLANUV),  (ws_a3, H_ARKUSH3), (ws_a4, H_ARKUSH4), (ws_a5, H_ARKUSH5),
+    ]:
+        ws.append(headers)
+
+    year = report_period.year if hasattr(report_period, "year") else 2026
+
+    for r in good_results:
+        fbytes     = r["_bytes"]
+        zoz_name   = r["name"]
+        zoz_edrpou = r["edrpou"]
+        wb = load_workbook(io.BytesIO(fbytes), data_only=True)
+        ws_exec = wb["Виконання"]
+        ws_rem  = wb["Залишки"]
+        ws_zvit = wb["Зведений звіт"]
+        ws_plan = wb["План"]
+
+        # ── "зведений": рядки з Зведений звіт ──────────────────────
+        for row in range(11, 120):
+            vac = ws_zvit.cell(row=row, column=1).value
+            age = ws_zvit.cell(row=row, column=2).value
+            pl  = ws_zvit.cell(row=row, column=3).value
+            mon = ws_zvit.cell(row=row, column=4).value
+            if vac is None and mon is None:
+                continue
+            ws_zv.append([vac, age, pl, mon, zoz_name, zoz_edrpou, report_period])
+
+        # ── "Аркуш2": рядки з Виконання (рядки 8-104) ───────────────
+        # Дані народжуваності — лише з рядку 8
+        born8  = ws_exec.cell(row=8, column=10).value
+        hepv18 = ws_exec.cell(row=8, column=11).value
+        born78 = ws_exec.cell(row=8, column=12).value
+        kdp38  = ws_exec.cell(row=8, column=13).value
+
+        for row in range(8, 105):
+            vac = ws_exec.cell(row=row, column=3).value
+            age = ws_exec.cell(row=row, column=4).value
+            cnt = ws_exec.cell(row=row, column=5).value
+            # народжуваність — тільки у першому рядку
+            born  = born8  if row == 8 else None
+            hepv1 = hepv18 if row == 8 else None
+            born7 = born78 if row == 8 else None
+            kdp3  = kdp38  if row == 8 else None
+            # протипокази КДП — рядки 8-10
+            kdp_lbl = ws_exec.cell(row=row, column=14).value if row <= 10 else None
+            kdp_cnt = ws_exec.cell(row=row, column=15).value if row <= 10 else None
+            temp_ci = ws_exec.cell(row=row, column=16).value if row <= 10 else None
+            perm_ci = ws_exec.cell(row=row, column=17).value if row <= 10 else None
+            all_ci  = ws_exec.cell(row=row, column=18).value if row <= 10 else None
+            # відмови — рядки 8-13
+            ref_dis = ws_exec.cell(row=row, column=19).value if row <= 13 else None
+            ref_cnt = ws_exec.cell(row=row, column=20).value if row <= 13 else None
+            ws_a2.append([
+                zoz_name, zoz_edrpou, vac, age, cnt, report_period,
+                born, hepv1, born7, kdp3,
+                kdp_lbl, kdp_cnt, temp_ci, perm_ci, all_ci,
+                ref_dis, ref_cnt,
+            ])
+
+        # ── "Аркуш3": народжуваність (1 рядок на ЗОЗ) ───────────────
+        ws_a3.append([
+            zoz_name, zoz_edrpou, report_period,
+            born8, hepv18, born78, kdp38,
+        ])
+
+        # ── "Аркуш4": протипокази КДП (3 рядки на ЗОЗ) ──────────────
+        for row in range(8, 11):
+            ws_a4.append([
+                zoz_name, zoz_edrpou, report_period,
+                ws_exec.cell(row=row, column=14).value,
+                ws_exec.cell(row=row, column=15).value,
+                ws_exec.cell(row=row, column=16).value,
+                ws_exec.cell(row=row, column=17).value,
+                ws_exec.cell(row=row, column=18).value,
+            ])
+
+        # ── "Аркуш5": відмови (6 рядків на ЗОЗ) ─────────────────────
+        for row in range(8, 14):
+            ws_a5.append([
+                ws_exec.cell(row=row, column=19).value,
+                ws_exec.cell(row=row, column=20).value,
+                report_period, zoz_name, zoz_edrpou,
+            ])
+
+        # ── "Залишок": рядки з Залишки ───────────────────────────────
+        for row in range(11, 38):
+            vac = ws_rem.cell(row=row, column=1).value
+            if not vac:
+                continue
+            ws_zal.append([
+                vac,
+                ws_rem.cell(row=row, column=2).value,
+                ws_rem.cell(row=row, column=3).value,
+                ws_rem.cell(row=row, column=4).value,
+                ws_rem.cell(row=row, column=5).value,
+                ws_rem.cell(row=row, column=6).value,
+                ws_rem.cell(row=row, column=7).value,
+                ws_rem.cell(row=row, column=8).value,
+                zoz_name, zoz_edrpou, report_period,
+            ])
+
+        # ── "Планування": рядки з План ───────────────────────────────
+        for row in range(11, 47):
+            noz = ws_plan.cell(row=row, column=4).value
+            if not noz:
+                continue
+            ws_pl.append([
+                zoz_name, zoz_edrpou, year,
+                noz,
+                ws_plan.cell(row=row, column=5).value,
+                ws_plan.cell(row=row, column=6).value,
+                ws_plan.cell(row=row, column=7).value,
+                ws_plan.cell(row=row, column=8).value,
+            ])
+
+    # Стиль заголовків
+    hdr_fill = PatternFill("solid", fgColor="1F4E79")
+    hdr_font = Font(color="FFFFFF", bold=True, size=10)
+    for ws in [ws_zv, ws_a2, ws_zal, ws_pl, ws_a3, ws_a4, ws_a5]:
+        for cell in ws[1]:
+            cell.fill = hdr_fill
+            cell.font = hdr_font
+            cell.alignment = Alignment(wrap_text=True, vertical="center")
+
+    out = io.BytesIO()
+    wb_out.save(out)
     out.seek(0)
     return out.getvalue()
 
@@ -914,26 +1194,72 @@ if "results" in st.session_state and "org_name" in st.session_state:
             st.markdown(f"До зведення включено **{len(good)}** файл(ів) з **{exp}** очікуваних.")
             if corr_log:
                 st.info(f"ℹ️ {len(corr_log)} файл(ів) були виправлені онлайн — використовуються виправлені версії.")
-            if st.button("⚙️ Створити зведений файл", type="primary", use_container_width=True):
-                with st.spinner("⏳ Зведення виконується..."):
-                    try:
-                        file_bytes_list = [(r["file"], r["_bytes"]) for r in good]
-                        result_bytes = aggregate_files(
-                            file_bytes_list,
-                            org_name      = st.session_state["org_name"],
-                            org_edrpou    = st.session_state["org_edrpou"],
-                            report_period = st.session_state["report_period"]
-                        )
-                        period_str = st.session_state["report_label"].replace(" ","_")
-                        st.success(f"✅ Успішно зведено {len(good)} файлів!")
-                        st.download_button(
-                            "⬇️ Завантажити зведений файл", data=result_bytes,
-                            file_name=f"Зведений_звіт_{period_str}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True, type="primary"
-                        )
-                    except Exception as e:
-                        st.error(f"❌ Помилка: {e}")
+
+            col_agg, col_lvl = st.columns(2)
+
+            with col_agg:
+                if st.button("⚙️ Створити зведений файл", type="primary", use_container_width=True):
+                    with st.spinner("⏳ Зведення виконується..."):
+                        try:
+                            file_bytes_list = [(r["file"], r["_bytes"]) for r in good]
+                            result_bytes = aggregate_files(
+                                file_bytes_list,
+                                org_name      = st.session_state["org_name"],
+                                org_edrpou    = st.session_state["org_edrpou"],
+                                report_period = st.session_state["report_period"]
+                            )
+                            period_str = st.session_state["report_label"].replace(" ","_")
+                            st.session_state["agg_bytes"] = result_bytes
+                            st.session_state["agg_name"]  = f"Зведений_звіт_{period_str}.xlsx"
+                            st.success(f"✅ Успішно зведено {len(good)} файлів!")
+                        except Exception as e:
+                            st.error(f"❌ Помилка: {e}")
+            if "agg_bytes" in st.session_state:
+                st.download_button(
+                    "⬇️ Завантажити зведений файл", data=st.session_state["agg_bytes"],
+                    file_name=st.session_state["agg_name"],
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True, type="primary", key="dl_agg"
+                )
+
+            st.divider()
+
+            with col_lvl:
+                if st.button("🏛️ Сформувати Level 1 файл", use_container_width=True,
+                             help="Плоскі таблиці для подачі на національний рівень (МОЗ/УЦКПХ)"):
+                    with st.spinner("⏳ Формування Level 1..."):
+                        try:
+                            lvl1_bytes = generate_level1_file(
+                                good,
+                                org_name      = st.session_state["org_name"],
+                                org_edrpou    = st.session_state["org_edrpou"],
+                                report_period = st.session_state["report_period"],
+                            )
+                            period_str = st.session_state["report_label"].replace(" ","_")
+                            st.session_state["lvl1_bytes"] = lvl1_bytes
+                            st.session_state["lvl1_name"]  = f"Level1_{period_str}.xlsx"
+                            st.success(f"✅ Level 1 файл сформовано ({len(good)} ЗОЗ)!")
+                        except Exception as e:
+                            st.error(f"❌ Помилка: {e}")
+            if "lvl1_bytes" in st.session_state:
+                st.download_button(
+                    "⬇️ Завантажити Level 1", data=st.session_state["lvl1_bytes"],
+                    file_name=st.session_state["lvl1_name"],
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True, key="dl_lvl1"
+                )
+                with st.expander("ℹ️ Що містить Level 1 файл"):
+                    st.markdown("""
+| Аркуш | Вміст | Рядків |
+|---|---|---|
+| `зведений` | Зведений звіт усіх ЗОЗ (вакцина/вік/план/місяць) | ~109 × кількість ЗОЗ |
+| `Аркуш2` | Деталізоване виконання + народжуваність + протипокази + відмови | ~97 × ЗОЗ |
+| `Залишок` | Залишки вакцин усіх ЗОЗ | ~27 × ЗОЗ |
+| `Планування` | Плани вакцинації усіх ЗОЗ | ~36 × ЗОЗ |
+| `Аркуш3` | Народжуваність і КДП (1 рядок на ЗОЗ) | = кількість ЗОЗ |
+| `Аркуш4` | Протипокази КДП (3 рядки на ЗОЗ) | = 3 × ЗОЗ |
+| `Аркуш5` | Відмови від щеплень (6 рядків на ЗОЗ) | = 6 × ЗОЗ |
+""")
 
         # ── Вкладка 2: Таблиця охоплення ─────────────────────────────
         with tab_coverage:
