@@ -75,6 +75,79 @@ def safe_num(val):
     except: return 0
 
 
+# ─────────────────────────────────────────────────────────────────────
+# ГРУПИ ОБ'ЄДНАНИХ ВАКЦИН
+# АКДП (цільноклітинний кашлюк) і АаКДП (ацелюлярний) — різні вакцини,
+# але захищають від одних хвороб (дифтерія, кашлюк, правець).
+# Для розрахунку % охоплення їх треба рахувати разом.
+# Аналогічно: АДП/АаКДП, АДПм/АаКДПм ревакцинації.
+# ─────────────────────────────────────────────────────────────────────
+# Формат: (відображувана назва групи, [назви вакцин], вікова група)
+VACCINE_GROUPS = [
+    ("КДП 1 доза (2 міс)",          ["АКДП1", "АаКДП1"],                           "2 місяці"),
+    ("КДП 1 доза (3 міс–до 1 р)",   ["АКДП1", "АаКДП1"],                           "3 місяці – до 1 року"),
+    ("КДП 1 доза (1–6 р)",          ["АКДП1", "АаКДП1"],                           "від 1 до 6 років"),
+    ("КДП 2 доза (до 1 р)",         ["АКДП2", "АаКДП2"],                           "до 1 року"),
+    ("КДП 2 доза (1–6 р)",          ["АКДП2", "АаКДП2"],                           "від 1 до 6 років"),
+    ("КДП 3 доза (до 1 р) ★",       ["АКДП3", "АаКДП3"],                           "до 1 року"),
+    ("КДП 3 доза (1–6 р)",          ["АКДП3", "АаКДП3"],                           "від 1 до 6 років"),
+    ("КДП 4 доза (18 міс) ★",       ["АКДП4", "АаКДП4"],                           "18 місяців"),
+    ("КДП 4 доза (2–6 р)",          ["АКДП4", "АаКДП4"],                           "від 2 до 6 років"),
+    ("АДП/АаКДП рев (6 р)",         ["АДП", "АаКДП", "АаКДПм"],                    "6 років"),
+    ("АДПм/АаКДПм (16 р)",          ["АДПм", "АаКДПм"],                            "16 років"),
+    ("АДПм/АаКДПм рев (7–17 р)",    ["АДПм ревакцинація", "АаКДПм ревакцинація"],  "від 7 до 17 років"),
+    ("АДПм/АаКДПм рев (дорослі)",   ["АДПм ревакцинація", "АаКДПм ревакцинація"],  "дорослі"),
+]
+
+# Множина (вакцина, вік) що входять у якусь групу — для фільтрації в UI
+_GROUPED_VAC_KEYS = {
+    (vac, age)
+    for _, vacs, age in VACCINE_GROUPS
+    for vac in vacs
+}
+
+
+def apply_vaccine_groups(coverage):
+    """
+    Додає об'єднані записи охоплення для груп вакцин (АКДП+АаКДП тощо).
+    Кожному індивідуальному запису додає прапор in_group=True якщо він
+    входить у якусь групу — щоб UI міг їх сховати.
+    """
+    grouped_items = []
+    for g_label, g_vaccines, g_age in VACCINE_GROUPS:
+        matches = [
+            item for item in coverage
+            if item["vaccine"] in g_vaccines
+            and item["age"] == g_age
+        ]
+        if not matches:
+            continue
+        total_plan = sum(item["plan"] for item in matches)
+        total_exec = sum(item["executed"] for item in matches)
+        pct = round(total_exec / total_plan * 100, 1) if total_plan > 0 else 0.0
+        grouped_items.append({
+            "label":    g_label,
+            "vaccine":  g_label,
+            "age":      g_age,
+            "plan":     total_plan,
+            "executed": total_exec,
+            "pct":      pct,
+            "is_group": True,
+            "in_group": False,
+        })
+
+    # Позначаємо індивідуальні записи що увійшли в групи
+    result = []
+    for item in coverage:
+        key = (item["vaccine"], item["age"])
+        new_item = dict(item)
+        new_item["is_group"] = False
+        new_item["in_group"] = key in _GROUPED_VAC_KEYS
+        result.append(new_item)
+
+    return result + grouped_items
+
+
 def get_col_letter(col_idx):
     result = ""
     while col_idx > 0:
@@ -275,6 +348,38 @@ def validate_file(file_bytes, filename):
                     f"План р{plan_row}={int(plan_v)} ≠ Зведений р{zvit_row}={int(zvit_v)}"
                 )
 
+        # ── НОВА: план-план крос-перевірки між вакцинами одного когорту ─
+        # Джерело: офіційне маппування МОЗ/Укрвак (Нові_форми_Укрвак_v1_1.xlsx)
+        # Одна популяція дітей → однаковий план для всіх вакцин серії
+        # Рядки Зведеного звіту (col C = річний план):
+        #   р20  = Поліо3 до 1 р   р34  = Геп В3 до 1 р
+        #   р52  = Hib3 до 1 р     р81  = АКДП3/АаКДП3 до 1 р
+        #   р23  = Поліо4 18 міс   р85  = АКДП4/АаКДП4 18 міс
+        #   р36  = Геп В4 18 міс   р53  = Hib4 18 міс
+        #   р26  = Поліо5 6 р      р89  = АДП 6 р
+        COHORT_CHECKS = [
+            # (anchor_row, [peer_rows], cohort_label)
+            (20, [34, 52, 81], "до 1 року (Поліо3 = ГепВ3 = Hib3 = КДП3)"),
+            (23, [85, 36, 53], "18 місяців (Поліо4 = КДП4 = ГепВ4 = Hib4)"),
+            (26, [89],         "6 років (Поліо5 = АДП)"),
+        ]
+        for anchor_row, peer_rows, cohort_label in COHORT_CHECKS:
+            anchor_val = safe_num(ws_zvit.cell(row=anchor_row, column=3).value)
+            if anchor_val <= 0:
+                continue
+            for peer_row in peer_rows:
+                peer_val = safe_num(ws_zvit.cell(row=peer_row, column=3).value)
+                if peer_val <= 0:
+                    continue
+                if abs(anchor_val - peer_val) / anchor_val > 0.01:  # допуск 1%
+                    vac_anchor = ws_zvit.cell(row=anchor_row, column=1).value
+                    vac_peer   = ws_zvit.cell(row=peer_row,   column=1).value
+                    warnings.append(
+                        f"Розбіжність планів когорту «{cohort_label}»: "
+                        f"«{str(vac_anchor or '').strip()}» р{anchor_row}={int(anchor_val)} ≠ "
+                        f"«{str(vac_peer or '').strip()}» р{peer_row}={int(peer_val)}"
+                    )
+
     except Exception as e:
         errors.append(f"Не вдалось прочитати файл: {e}")
 
@@ -450,19 +555,59 @@ def extract_facility_data(file_bytes, name, edrpou):
     ws_rem  = wb["Залишки"]
     ws_zvit = wb["Зведений звіт"]
 
-    coverage = []
+    # Читаємо всі рядки — навіть без плану, щоб мати дані для груп АаКДП
+    coverage_raw = []
     for row in range(11, 120):
         vaccine  = ws_zvit.cell(row=row, column=1).value
         age      = ws_zvit.cell(row=row, column=2).value
         plan     = ws_zvit.cell(row=row, column=3).value
         executed = ws_zvit.cell(row=row, column=4).value
-        pct      = ws_zvit.cell(row=row, column=6).value
-        if vaccine and isinstance(plan, (int, float)) and plan > 0:
-            label = str(vaccine).strip()
-            if age: label += f" ({str(age).strip()})"
-            coverage.append({"label": label, "vaccine": str(vaccine).strip(),
-                             "age": str(age or "").strip(), "plan": safe_num(plan),
-                             "executed": safe_num(executed), "pct": safe_num(pct)})
+        if not vaccine: continue
+        vac_str = str(vaccine).strip()
+        age_str = str(age or "").strip()
+        # пропускаємо підсумкові рядки "всього"
+        if not age_str and "всього" in vac_str.lower(): continue
+        plan_num = safe_num(plan) if isinstance(plan, (int, float)) else 0
+        exec_num = safe_num(executed)
+        coverage_raw.append({
+            "label":    f"{vac_str} ({age_str})" if age_str else vac_str,
+            "vaccine":  vac_str,
+            "age":      age_str,
+            "plan":     plan_num,
+            "executed": exec_num,
+            "pct":      round(exec_num / plan_num * 100, 1) if plan_num > 0 else 0.0,
+            "is_group": False,
+            "in_group": False,
+        })
+
+    # Додаємо об'єднані групи (АКДП+АаКДП тощо)
+    coverage = apply_vaccine_groups(coverage_raw)
+
+    # Геп В — ключовий показник: В3 до 1 року
+    hepb_rows = [i for i in coverage_raw if i["vaccine"].startswith("Гепатит В") and i["age"]]
+    hepb3_child = [i for i in hepb_rows if "В3" in i["vaccine"] and "до 1 року" in i["age"]]
+    if hepb3_child:
+        p = sum(i["plan"] for i in hepb3_child)
+        e = sum(i["executed"] for i in hepb3_child)
+        coverage.append({
+            "label": "Геп В°3 (до 1 р) ★", "vaccine": "Геп В°3 (до 1 р) ★",
+            "age": "до 1 року", "plan": p, "executed": e,
+            "pct": round(e/p*100, 1) if p > 0 else 0.0,
+            "is_group": True, "in_group": False,
+        })
+    # Геп В — сумарний % по всіх дозах (В1+В2+В3) для дітей
+    hepb_all_child = [i for i in hepb_rows
+                      if any(d in i["vaccine"] for d in ["В1","В2","В3"])
+                      and i["age"] not in ("дорослі", "1 доба життя")]
+    if hepb_all_child and sum(i["plan"] for i in hepb_all_child) > 0:
+        p = sum(i["plan"] for i in hepb_all_child)
+        e = sum(i["executed"] for i in hepb_all_child)
+        coverage.append({
+            "label": "Геп В (всі дози, діти)", "vaccine": "Геп В (всі дози, діти)",
+            "age": "", "plan": p, "executed": e,
+            "pct": round(e/p*100, 1) if p > 0 else 0.0,
+            "is_group": True, "in_group": False,
+        })
 
     stocks = []
     for row in range(11, 38):
@@ -1264,10 +1409,20 @@ if "results" in st.session_state and "org_name" in st.session_state:
         # ── Вкладка 2: Таблиця охоплення ─────────────────────────────
         with tab_coverage:
             all_facility_names = [fd["name"] for fd in facility_data_list]
+
+            show_groups_cov = st.toggle(
+                "Об'єднати АКДП + АаКДП у групи КДП",
+                value=True, key="toggle_groups_cov",
+                help="Увімк: АКДП3 + АаКДП3 = КДП 3 доза. Вимк: кожна вакцина окремо."
+            )
+
             all_labels = []
             seen = set()
             for fd in facility_data_list:
                 for item in fd["coverage"]:
+                    if item["plan"] <= 0: continue
+                    if show_groups_cov and item["in_group"]: continue
+                    if not show_groups_cov and item["is_group"]: continue
                     if item["label"] not in seen:
                         all_labels.append(item["label"]); seen.add(item["label"])
 
@@ -1282,6 +1437,10 @@ if "results" in st.session_state and "org_name" in st.session_state:
                 sel_all_i = st.checkbox("Обрати всі показники", value=True, key="all_ind")
                 selected_indicators = all_labels if sel_all_i else st.multiselect(
                     "Оберіть показники:", all_labels, default=all_labels)
+
+            if show_groups_cov:
+                st.caption("★ В таблиці будуть об'єднані групи: наприклад «КДП 3 доза (до 1 р) ★» = АКДП3 + АаКДП3. "
+                           "Вимкніть перемикач вище щоб побачити кожну вакцину окремо.")
 
             if selected_facilities and selected_indicators:
                 if st.button("⚙️ Сформувати таблицю охоплення", type="primary", use_container_width=True):
@@ -1303,42 +1462,92 @@ if "results" in st.session_state and "org_name" in st.session_state:
 
             with d1:
                 st.subheader("💉 Охоплення щепленнями")
+
+                # Перемикач: групи (АКДП+АаКДП разом) або деталізація
+                show_groups = st.toggle(
+                    "Об'єднати АКДП + АаКДП у групи КДП",
+                    value=True, key="toggle_groups_d1",
+                    help="Увімк: показує КДП 3 доза = АКДП3 + АаКДП3. Вимк: кожна вакцина окремо."
+                )
+
+                # Агрегуємо по всіх ЗОЗ
                 agg = {}
                 for fd in facility_data_list:
                     for item in fd["coverage"]:
-                        if item["label"] not in agg: agg[item["label"]] = {"plan":0,"executed":0}
+                        # фільтр режиму груп
+                        if show_groups and item["in_group"]: continue   # ховаємо окремі якщо є група
+                        if not show_groups and item["is_group"]: continue  # ховаємо групи якщо деталі
+                        if item["label"] not in agg:
+                            agg[item["label"]] = {"plan":0,"executed":0,"is_group":item.get("is_group",False)}
                         agg[item["label"]]["plan"]     += item["plan"]
                         agg[item["label"]]["executed"] += item["executed"]
-                df_agg = pd.DataFrame([{"Вакцина / Вік": l, "План": v["plan"], "Виконано": v["executed"],
-                                        "%": round(v["executed"]/v["plan"]*100,1) if v["plan"]>0 else 0}
-                                       for l,v in agg.items()]).sort_values("%", ascending=True)
+
+                df_agg = pd.DataFrame([{
+                    "Вакцина / Вік": l,
+                    "План": v["plan"], "Виконано": v["executed"],
+                    "%": round(v["executed"]/v["plan"]*100,1) if v["plan"]>0 else 0,
+                    "Група": "★ Група" if v["is_group"] else "",
+                } for l,v in agg.items() if v["plan"]>0]).sort_values("%", ascending=True)
+
                 all_v = df_agg["Вакцина / Вік"].tolist()
-                sel_v = st.multiselect("Оберіть вакцини:", all_v, default=all_v[:15] if len(all_v)>15 else all_v, key="dv")
+                sel_v = st.multiselect("Оберіть вакцини:", all_v,
+                                       default=all_v[:15] if len(all_v)>15 else all_v, key="dv")
                 df_f = df_agg[df_agg["Вакцина / Вік"].isin(sel_v)]
                 if not df_f.empty:
                     colors_list = ["#2ECC71" if p>=95 else "#F39C12" if p>=85 else "#E74C3C" for p in df_f["%"]]
-                    fig = go.Figure(go.Bar(x=df_f["%"], y=df_f["Вакцина / Вік"], orientation="h",
-                                          marker_color=colors_list, text=[f"{p}%" for p in df_f["%"]],
-                                          textposition="outside",
-                                          hovertemplate="<b>%{y}</b><br>%{x}%<extra></extra>"))
+                    # Групи виділяємо жирнішою смугою
+                    line_widths = [2 if g=="★ Група" else 0 for g in df_f["Група"]]
+                    fig = go.Figure(go.Bar(
+                        x=df_f["%"], y=df_f["Вакцина / Вік"], orientation="h",
+                        marker_color=colors_list,
+                        marker_line_color=["#1A5276" if g=="★ Група" else "rgba(0,0,0,0)" for g in df_f["Група"]],
+                        marker_line_width=line_widths,
+                        text=[f"{p}%{' ★' if g=='★ Група' else ''}" for p,g in zip(df_f["%"],df_f["Група"])],
+                        textposition="outside",
+                        hovertemplate="<b>%{y}</b><br>%{x}%<extra></extra>",
+                    ))
                     fig.add_vline(x=95, line_dash="dash", line_color="green", annotation_text="95%")
                     fig.add_vline(x=85, line_dash="dash", line_color="orange", annotation_text="85%")
-                    fig.update_layout(xaxis=dict(range=[0,120]), xaxis_title="% виконання",
-                                      height=max(400,len(df_f)*30), margin=dict(l=10,r=80,t=20,b=40),
+                    fig.update_layout(xaxis=dict(range=[0,130]), xaxis_title="% виконання",
+                                      height=max(400,len(df_f)*32), margin=dict(l=10,r=80,t=20,b=40),
                                       plot_bgcolor="white")
                     st.plotly_chart(fig, use_container_width=True)
                     lc1,lc2,lc3 = st.columns(3)
                     lc1.success("🟢 ≥ 95%"); lc2.warning("🟡 85–95%"); lc3.error("🔴 < 85%")
+                    if show_groups:
+                        st.caption("★ Позначені рядки — об'єднані групи (наприклад, АКДП3 + АаКДП3 разом). "
+                                   "Вимкніть перемикач вище щоб побачити кожну вакцину окремо.")
 
             with d2:
                 st.subheader("🏆 Рейтинг закладів")
-                all_vr = sorted({item["label"] for fd in facility_data_list for item in fd["coverage"]})
-                mode = st.radio("Показник:", ["Середній % по всіх вакцинах","По обраній вакцині"], horizontal=True)
+
+                show_groups_r = st.toggle(
+                    "Об'єднати АКДП + АаКДП у групи КДП",
+                    value=True, key="toggle_groups_d2",
+                )
+
+                # Для рейтингу будуємо список вакцин з урахуванням режиму
+                all_vr = sorted({
+                    item["label"]
+                    for fd in facility_data_list
+                    for item in fd["coverage"]
+                    if item["plan"] > 0
+                    and (show_groups_r ^ item["in_group"])   # XOR: groups mode → skip in_group; detail → skip is_group
+                    and (not show_groups_r or not item["in_group"])
+                    and (show_groups_r or not item["is_group"])
+                })
+                mode = st.radio("Показник:", ["Середній % по всіх вакцинах","По обраній вакцині"], horizontal=True, key="mode_r")
                 sel_vr = st.selectbox("Оберіть вакцину:", all_vr, key="rv") if mode=="По обраній вакцині" else None
                 rows_r = []
                 for fd in facility_data_list:
+                    items_r = [
+                        i for i in fd["coverage"]
+                        if i["plan"] > 0
+                        and (not show_groups_r or not i["in_group"])
+                        and (show_groups_r or not i["is_group"])
+                    ]
                     if mode == "Середній % по всіх вакцинах":
-                        pcts = [i["pct"] for i in fd["coverage"] if i["plan"]>0]
+                        pcts = [i["pct"] for i in items_r]
                         rows_r.append({"Заклад":fd["name"], "%": round(sum(pcts)/len(pcts),1) if pcts else 0})
                     else:
                         p = next((i["pct"] for i in fd["coverage"] if i["label"]==sel_vr), 0)
